@@ -365,6 +365,33 @@ public class FlinkConnectorOptions {
                     .withDescription(
                             "Allow sink committer and writer operator to be chained together");
 
+    public static final ConfigOption<Duration>
+            SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_PER_COMMITTABLE =
+                    ConfigOptions.key("sink.committer-recovery-failover-delay-per-committable")
+                            .durationType()
+                            .defaultValue(Duration.ZERO)
+                            .withDescription(
+                                    "After recommitting restored committables during recovery, a committer "
+                                            + "throws an intended failure so that writers reinitialize from the new "
+                                            + "snapshots. Committer subtasks recover independently, so the first one "
+                                            + "to finish fails the job while its siblings are still recommitting, "
+                                            + "and those committables have to be recovered again on the next attempt. "
+                                            + "Waiting before the intended failure gives the siblings time to finish, "
+                                            + "reducing the number of restarts needed to converge. The wait is this "
+                                            + "duration multiplied by the number of recommitted committables, capped "
+                                            + "by 'sink.committer-recovery-failover-delay-max'. Waiting is free with "
+                                            + "respect to correctness because no checkpoint can complete while a "
+                                            + "committer is still initializing. Set to '0 s' to disable.");
+
+    public static final ConfigOption<Duration> SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_MAX =
+            ConfigOptions.key("sink.committer-recovery-failover-delay-max")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(1))
+                    .withDescription(
+                            "Upper bound for the wait configured by "
+                                    + "'sink.committer-recovery-failover-delay-per-committable'. "
+                                    + "Set to '0 s' to disable waiting altogether.");
+
     public static final ConfigOption<PartitionMarkDoneActionMode> PARTITION_MARK_DONE_MODE =
             key("partition.mark-done-action.mode")
                     .enumType(PartitionMarkDoneActionMode.class)
