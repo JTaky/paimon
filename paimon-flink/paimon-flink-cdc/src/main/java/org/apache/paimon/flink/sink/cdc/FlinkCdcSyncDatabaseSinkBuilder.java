@@ -87,6 +87,10 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
     private String commitUser;
     private TableFilter tableFilter;
 
+    // Retained so that the multiplex sink can read options which are not extracted into a
+    // dedicated field above.
+    private Options tableOptions = new Options();
+
     public FlinkCdcSyncDatabaseSinkBuilder<T> withInput(DataStream<T> input) {
         this.input = input;
         return this;
@@ -114,6 +118,7 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
         this.committerCpu = options.get(FlinkConnectorOptions.SINK_COMMITTER_CPU);
         this.committerMemory = options.get(FlinkConnectorOptions.SINK_COMMITTER_MEMORY);
         this.commitUser = createCommitUser(options);
+        this.tableOptions = options;
         return this;
     }
 
@@ -199,6 +204,7 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
                         committerCpu,
                         committerMemory,
                         commitUser,
+                        tableOptions,
                         eagerInit,
                         tableFilter);
         sink.sinkFrom(partitioned);

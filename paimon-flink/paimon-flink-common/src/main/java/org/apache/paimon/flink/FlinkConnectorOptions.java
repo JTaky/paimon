@@ -353,6 +353,49 @@ public class FlinkConnectorOptions {
                     .withDescription(
                             "Allow sink committer and writer operator to be chained together");
 
+    public static final ConfigOption<Duration>
+            SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_PER_COMMITTABLE =
+                    ConfigOptions.key("sink.committer-recovery-failover-delay-per-committable")
+                            .durationType()
+                            .defaultValue(Duration.ZERO)
+                            .withDescription(
+                                    "After recommitting restored committables during recovery, a committer "
+                                            + "throws an intended failure so that writers reinitialize from the new "
+                                            + "snapshots. Committer subtasks recover independently, so the first one "
+                                            + "to finish fails the job while its siblings are still recommitting, "
+                                            + "and those committables have to be recovered again on the next attempt. "
+                                            + "Waiting before the intended failure gives the siblings time to finish, "
+                                            + "reducing the number of restarts needed to converge. The wait is this "
+                                            + "duration scaled by the number of recommitted committables according to "
+                                            + "'sink.committer-recovery-failover-delay-scaling', capped "
+                                            + "by 'sink.committer-recovery-failover-delay-max'. Waiting is free with "
+                                            + "respect to correctness because no checkpoint can complete while a "
+                                            + "committer is still initializing. Set to '0 s' to disable.");
+
+    public static final ConfigOption<Duration> SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_MAX =
+            ConfigOptions.key("sink.committer-recovery-failover-delay-max")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(1))
+                    .withDescription(
+                            "Upper bound for the wait configured by "
+                                    + "'sink.committer-recovery-failover-delay-per-committable'. "
+                                    + "Set to '0 s' to disable waiting altogether.");
+
+    public static final ConfigOption<FailoverDelayScaling>
+            SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_SCALING =
+                    key("sink.committer-recovery-failover-delay-scaling")
+                            .enumType(FailoverDelayScaling.class)
+                            .defaultValue(FailoverDelayScaling.LINEAR)
+                            .withDescription(
+                                    "How the wait configured by "
+                                            + "'sink.committer-recovery-failover-delay-per-committable' scales with "
+                                            + "the number of recommitted committables. Every mode returns exactly the "
+                                            + "configured duration for a single committable, so changing this only "
+                                            + "affects subtasks that recommitted more than one. Sublinear modes suit "
+                                            + "high committer parallelism, where what a subtask waits for is the "
+                                            + "spread between itself and its slowest sibling rather than the total "
+                                            + "amount of work.");
+
     public static final ConfigOption<PartitionMarkDoneActionMode> PARTITION_MARK_DONE_MODE =
             key("partition.mark-done-action.mode")
                     .enumType(PartitionMarkDoneActionMode.class)
@@ -540,6 +583,55 @@ public class FlinkConnectorOptions {
 
         /** Use in-memory caching mode. */
         MEMORY
+    }
+
+    /**
+     * How the committer recovery failover delay scales with the number of recommitted committables.
+     * Every mode is 1x at a single committable, so the configured duration keeps its meaning.
+     */
+    public enum FailoverDelayScaling implements DescribedEnum {
+        LINEAR("linear", "Multiply by the number of recommitted committables."),
+
+        SQRT("sqrt", "Multiply by the square root of the number of recommitted committables."),
+
+        LOG(
+                "log",
+                "Multiply by one plus the natural logarithm of the number of recommitted "
+                        + "committables.");
+
+        private final String value;
+        private final String description;
+
+        FailoverDelayScaling(String value, String description) {
+            this.value = value;
+            this.description = description;
+        }
+
+        /** Scaling factor to apply to the configured per-committable duration. Always >= 1. */
+        public double factor(int numCommitted) {
+            if (numCommitted <= 1) {
+                return 1.0;
+            }
+            switch (this) {
+                case SQRT:
+                    return Math.sqrt(numCommitted);
+                case LOG:
+                    return 1.0 + Math.log(numCommitted);
+                case LINEAR:
+                default:
+                    return numCommitted;
+            }
+        }
+
+        @Override
+        public String toString() {
+            return value;
+        }
+
+        @Override
+        public InlineElement getDescription() {
+            return text(description);
+        }
     }
 
     /** Watermark emit strategy for scan. */
