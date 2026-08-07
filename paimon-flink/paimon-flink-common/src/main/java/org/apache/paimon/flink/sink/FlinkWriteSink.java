@@ -33,6 +33,8 @@ import javax.annotation.Nullable;
 import java.util.Map;
 
 import static org.apache.paimon.flink.FlinkConnectorOptions.PARTITION_MARK_DONE_RECOVER_FROM_STATE;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_MAX;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_PER_COMMITTABLE;
 
 /** A {@link FlinkSink} to write records. */
 public abstract class FlinkWriteSink<T> extends FlinkSink<T> {
@@ -66,7 +68,9 @@ public abstract class FlinkWriteSink<T> extends FlinkSink<T> {
         Options options = table.coreOptions().toConfiguration();
         return new RestoreAndFailCommittableStateManager<>(
                 ManifestCommittableSerializer::new,
-                options.get(PARTITION_MARK_DONE_RECOVER_FROM_STATE));
+                options.get(PARTITION_MARK_DONE_RECOVER_FROM_STATE),
+                options.get(SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_PER_COMMITTABLE),
+                options.get(SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_MAX));
     }
 
     protected static OneInputStreamOperatorFactory<InternalRow, Committable>
