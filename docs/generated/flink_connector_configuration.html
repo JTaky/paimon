@@ -273,6 +273,24 @@ under the License.
             <td>Allow sink committer and writer operator to be chained together</td>
         </tr>
         <tr>
+            <td><h5>sink.committer-recovery-failover-delay-max</h5></td>
+            <td style="word-wrap: break-word;">1 min</td>
+            <td>Duration</td>
+            <td>Upper bound for the wait configured by 'sink.committer-recovery-failover-delay-per-committable'. Set to '0 s' to disable waiting altogether.</td>
+        </tr>
+        <tr>
+            <td><h5>sink.committer-recovery-failover-delay-per-committable</h5></td>
+            <td style="word-wrap: break-word;">0 ms</td>
+            <td>Duration</td>
+            <td>After recommitting restored committables during recovery, a committer throws an intended failure so that writers reinitialize from the new snapshots. Committer subtasks recover independently, so the first one to finish fails the job while its siblings are still recommitting, and those committables have to be recovered again on the next attempt. Waiting before the intended failure gives the siblings time to finish, reducing the number of restarts needed to converge. The wait is this duration scaled by the number of recommitted committables according to 'sink.committer-recovery-failover-delay-scaling', capped by 'sink.committer-recovery-failover-delay-max'. Waiting is free with respect to correctness because no checkpoint can complete while a committer is still initializing. Set to '0 s' to disable.</td>
+        </tr>
+        <tr>
+            <td><h5>sink.committer-recovery-failover-delay-scaling</h5></td>
+            <td style="word-wrap: break-word;">linear</td>
+            <td><p>Enum</p></td>
+            <td>How the wait configured by 'sink.committer-recovery-failover-delay-per-committable' scales with the number of recommitted committables. Every mode returns exactly the configured duration for a single committable, so changing this only affects subtasks that recommitted more than one. Sublinear modes suit high committer parallelism, where what a subtask waits for is the spread between itself and its slowest sibling rather than the total amount of work.<br /><br />Possible values:<ul><li>"linear": Multiply by the number of recommitted committables.</li><li>"sqrt": Multiply by the square root of the number of recommitted committables.</li><li>"log": Multiply by one plus the natural logarithm of the number of recommitted committables.</li></ul></td>
+        </tr>
+        <tr>
             <td><h5>sink.coordinator-commit.enabled</h5></td>
             <td style="word-wrap: break-word;">false</td>
             <td>Boolean</td>

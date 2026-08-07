@@ -49,6 +49,9 @@ import javax.annotation.Nullable;
 import java.io.Serializable;
 import java.util.Collections;
 
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_MAX;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_PER_COMMITTABLE;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_SCALING;
 import static org.apache.paimon.flink.sink.FlinkSink.assertStreamingConfiguration;
 import static org.apache.paimon.flink.sink.FlinkSink.configureSlotSharingGroup;
 import static org.apache.paimon.flink.utils.ParallelismUtils.forwardParallelism;
@@ -69,6 +72,7 @@ public class FlinkCdcMultiTableSink implements Serializable {
     private final double commitCpuCores;
     @Nullable private final MemorySize commitHeapMemory;
     private final String commitUser;
+    private final Options tableOptions;
     private boolean eagerInit = false;
     private TableFilter tableFilter;
 
@@ -81,12 +85,35 @@ public class FlinkCdcMultiTableSink implements Serializable {
             String commitUser,
             boolean eagerInit,
             TableFilter tableFilter) {
+        this(
+                catalogLoader,
+                writeCpuCores,
+                writeHeapMemory,
+                commitCpuCores,
+                commitHeapMemory,
+                commitUser,
+                new Options(),
+                eagerInit,
+                tableFilter);
+    }
+
+    public FlinkCdcMultiTableSink(
+            CatalogLoader catalogLoader,
+            double writeCpuCores,
+            @Nullable MemorySize writeHeapMemory,
+            double commitCpuCores,
+            @Nullable MemorySize commitHeapMemory,
+            String commitUser,
+            Options tableOptions,
+            boolean eagerInit,
+            TableFilter tableFilter) {
         this.catalogLoader = catalogLoader;
         this.writeCpuCores = writeCpuCores;
         this.writeHeapMemory = writeHeapMemory;
         this.commitCpuCores = commitCpuCores;
         this.commitHeapMemory = commitHeapMemory;
         this.commitUser = commitUser;
+        this.tableOptions = tableOptions;
         this.eagerInit = eagerInit;
         this.tableFilter = tableFilter;
     }
@@ -177,6 +204,10 @@ public class FlinkCdcMultiTableSink implements Serializable {
 
     protected CommittableStateManager<WrappedManifestCommittable> createCommittableStateManager() {
         return new RestoreAndFailCommittableStateManager<>(
-                WrappedManifestCommittableSerializer::new, true);
+                WrappedManifestCommittableSerializer::new,
+                true,
+                tableOptions.get(SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_PER_COMMITTABLE),
+                tableOptions.get(SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_MAX),
+                tableOptions.get(SINK_COMMITTER_RECOVERY_FAILOVER_DELAY_SCALING));
     }
 }
