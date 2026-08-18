@@ -487,6 +487,44 @@ public class IcebergRestMetadataCommitterTest {
     }
 
     @Test
+    public void testCustomTablePropertyCollidingWithManagedKeyIsIgnored() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        // "write.metadata.previous-versions-max" is a key Paimon itself manages via the dedicated
+        // metadata.iceberg.previous-versions-max option; a custom property colliding with it must
+        // not override the dedicated option's value.
+        customOptions.put(
+                IcebergOptions.TABLE_PROPERTIES_PREFIX + "write.metadata.previous-versions-max",
+                "99");
+        customOptions.put(IcebergOptions.TABLE_PROPERTIES_PREFIX + "dd.table-color", "purple");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        customOptions);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.properties()).containsEntry("dd.table-color", "purple");
+        assertThat(icebergTable.properties())
+                .containsEntry("write.metadata.previous-versions-max", "1");
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
     public void testCustomTablePropertiesSurviveTableRecreate() throws Exception {
         RowType rowType =
                 RowType.of(

@@ -411,8 +411,17 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         }
     }
 
+    // Keys Paimon itself manages via dedicated options (previousVersionsMax(),
+    // deleteAfterCommitEnabled()) — a custom property colliding with one of these would silently
+    // override the dedicated option's value on every commit (since it's applied via putAll() after
+    // the managed values), while the "changed" comparison keeps comparing against the managed
+    // value, producing a redundant SetProperties update on every subsequent commit forever.
+    private static final Set<String> MANAGED_PROPERTIES =
+            Set.of(METADATA_PREVIOUS_VERSIONS_MAX, METADATA_DELETE_AFTER_COMMIT_ENABLED);
+
     // Custom table properties requested via metadata.iceberg.table-properties.<key>, with
-    // Iceberg-reserved keys filtered out (Iceberg's TableMetadata rejects them outright).
+    // Iceberg-reserved keys and Paimon-managed keys filtered out (the former because Iceberg's
+    // TableMetadata rejects them outright, the latter to avoid fighting our own dedicated options).
     private Map<String, String> customTableProperties() {
         Map<String, String> customProperties = icebergOptions.icebergTableProperties();
         Map<String, String> filtered = new HashMap<>();
@@ -422,6 +431,14 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                         LOG.warn(
                                 "Ignoring custom Iceberg table property '{}' for table {}: "
                                         + "it collides with an Iceberg-reserved property.",
+                                key,
+                                icebergTableIdentifier);
+                    } else if (MANAGED_PROPERTIES.contains(key)) {
+                        LOG.warn(
+                                "Ignoring custom Iceberg table property '{}' for table {}: "
+                                        + "it collides with a Paimon-managed property (set "
+                                        + "metadata.iceberg.previous-versions-max / "
+                                        + "metadata.iceberg.delete-after-commit.enabled instead).",
                                 key,
                                 icebergTableIdentifier);
                     } else {
