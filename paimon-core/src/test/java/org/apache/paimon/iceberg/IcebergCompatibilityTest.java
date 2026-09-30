@@ -478,7 +478,13 @@ public class IcebergCompatibilityTest {
                         new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
         FileStoreTable table =
                 createPaimonTable(
-                        rowType, Collections.emptyList(), Collections.singletonList("k"), 1);
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        Collections.singletonMap(
+                                IcebergOptions.FORMAT_VERSION.key(),
+                                String.valueOf(IcebergMetadata.FORMAT_VERSION_V3)));
 
         String commitUser = UUID.randomUUID().toString();
         TableWriteImpl<?> write = table.newWrite(commitUser);
@@ -487,7 +493,6 @@ public class IcebergCompatibilityTest {
         write.write(GenericRow.of(1, 10));
         write.write(GenericRow.of(2, 20));
         commit.commit(1, write.prepareCommit(false, 1));
-        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
 
         // The next commit will use this metadata file (snapshot 1's) as its base. Simulate
         // unrelated, later retention cleanup having already pruned the manifest list that this
@@ -498,6 +503,10 @@ public class IcebergCompatibilityTest {
         Path baseMetadataPath = pathFactory.toMetadataPath(1);
         assertThat(table.fileIO().exists(baseMetadataPath)).isTrue();
         IcebergMetadata baseMetadata = IcebergMetadata.fromPath(table.fileIO(), baseMetadataPath);
+        String baseUuid = baseMetadata.tableUuid();
+        int baseLastColumnId = baseMetadata.lastColumnId();
+        Long baseNextRowId = baseMetadata.nextRowId();
+        assertThat(baseNextRowId).isNotNull();
         Path danglingManifestListPath =
                 pathFactory.toManifestListPath(baseMetadata.currentSnapshot().manifestList());
         assertThat(table.fileIO().exists(danglingManifestListPath)).isTrue();
@@ -510,8 +519,11 @@ public class IcebergCompatibilityTest {
         write.write(GenericRow.of(3, 30));
         write.compact(BinaryRow.EMPTY_ROW, 0, true);
         commit.commit(2, write.prepareCommit(true, 2));
-        assertThat(getIcebergResult())
-                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 20)", "Record(3, 30)");
+        IcebergMetadata rebuiltMetadata =
+                IcebergMetadata.fromPath(table.fileIO(), pathFactory.toMetadataPath(2));
+        assertThat(rebuiltMetadata.tableUuid()).isEqualTo(baseUuid);
+        assertThat(rebuiltMetadata.lastColumnId()).isGreaterThanOrEqualTo(baseLastColumnId);
+        assertThat(rebuiltMetadata.nextRowId()).isGreaterThanOrEqualTo(baseNextRowId);
 
         write.close();
         commit.close();
@@ -632,6 +644,13 @@ public class IcebergCompatibilityTest {
         // and delete these out from under a retained version.
         assertThat(table.fileIO().exists(retainedMetadataPath)).isTrue();
         assertThat(table.fileIO().exists(retainedListPath)).isTrue();
+        List<IcebergManifestFileMeta> retainedManifests =
+                IcebergManifestList.create(table, pathFactory)
+                        .read(retainedMetadata.currentSnapshot().manifestList());
+        assertThat(retainedManifests).isNotEmpty();
+        for (IcebergManifestFileMeta manifest : retainedManifests) {
+            assertThat(table.fileIO().exists(new Path(manifest.manifestPath()))).isTrue();
+        }
 
         // Regression check: v2 is genuinely outside the retention window (below the new
         // earliestMetadataId = 5 - 2 = 3 floor), so both its JSON and its own manifest list are

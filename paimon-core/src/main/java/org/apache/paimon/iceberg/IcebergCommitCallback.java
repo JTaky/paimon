@@ -431,30 +431,21 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
             Path baseMetadataPath = pathFactory.toMetadataPath(snapshotId - 1);
 
             if (table.fileIO().exists(baseMetadataPath)) {
+                IcebergMetadata baseMetadata =
+                        IcebergMetadata.fromPath(table.fileIO(), baseMetadataPath);
                 try {
-                    createMetadataWithBase(
-                            fileChangesCollector,
-                            indexFiles.stream()
-                                    .filter(
-                                            index ->
-                                                    index.indexFile()
-                                                            .indexType()
-                                                            .equals(DELETION_VECTORS_INDEX))
-                                    .collect(Collectors.toList()),
-                            snapshot,
-                            baseMetadataPath,
-                            abandonedLastColumnId,
-                            abandonedNextRowId);
-                } catch (RuntimeException e) {
+                    readBaseManifestList(baseMetadata);
+                } catch (IOException | RuntimeException e) {
                     if (!ExceptionUtils.findThrowable(e, FileNotFoundException.class).isPresent()) {
+                        if (e instanceof IOException) {
+                            throw (IOException) e;
+                        }
                         throw e;
                     }
-                    // The base metadata file itself exists, but a manifest or manifest list it
-                    // transitively references (from its historical snapshot chain) has already
-                    // been pruned by unrelated, later retention cleanup, so the base is unusable
-                    // even though it exists. Rebuild from scratch instead of crashing permanently
-                    // on every retry: this loses that snapshot's Iceberg-side history/lineage,
-                    // the same tradeoff already accepted when the base file is simply absent.
+                    // The JSON is still usable, so preserve its identity and high-water marks
+                    // while rebuilding after a missing dependency. Do this before any new
+                    // manifest is written; a missing file during publication or cleanup must
+                    // fail the commit rather than trigger a second rebuild.
                     LOG.warn(
                             "Failed to read base Iceberg metadata {} for table {} because a file "
                                     + "it references is missing. Falling back to recreating "
@@ -463,8 +454,30 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                             table.fullName(),
                             e);
                     createMetadataWithoutBase(
-                            snapshotId, abandonedUuid, abandonedLastColumnId, abandonedNextRowId);
+                            snapshotId,
+                            baseMetadata.tableUuid(),
+                            Math.max(abandonedLastColumnId, baseMetadata.lastColumnId()),
+                            Math.max(
+                                    abandonedNextRowId,
+                                    baseMetadata.nextRowId() == null
+                                            ? 0L
+                                            : baseMetadata.nextRowId()));
+                    return;
                 }
+                createMetadataWithBase(
+                        fileChangesCollector,
+                        indexFiles.stream()
+                                .filter(
+                                        index ->
+                                                index.indexFile()
+                                                        .indexType()
+                                                        .equals(DELETION_VECTORS_INDEX))
+                                .collect(Collectors.toList()),
+                        snapshot,
+                        baseMetadata,
+                        baseMetadataPath,
+                        abandonedLastColumnId,
+                        abandonedNextRowId);
             } else {
                 createMetadataWithoutBase(
                         snapshotId, abandonedUuid, abandonedLastColumnId, abandonedNextRowId);
@@ -956,16 +969,25 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         return identity == null || identity.equals(commitIdentity(snapshot));
     }
 
+    /** Reads the base manifest list before extending its metadata. */
+    private void readBaseManifestList(IcebergMetadata baseMetadata) throws IOException {
+        IcebergSnapshot currentSnapshot = baseMetadata.currentSnapshot();
+        if (currentSnapshot == null) {
+            return;
+        }
+        manifestList.read(currentSnapshot.manifestList());
+    }
+
     private void createMetadataWithBase(
             FileChangesCollector fileChangesCollector,
             List<IndexManifestEntry> indexFiles,
             Snapshot snapshot,
+            IcebergMetadata baseMetadata,
             Path baseMetadataPath,
             int lastColumnIdFloor,
             long nextRowIdFloor)
             throws IOException {
         long snapshotId = snapshot.id();
-        IcebergMetadata baseMetadata = IcebergMetadata.fromPath(table.fileIO(), baseMetadataPath);
         // row ids handed out by the base or by abandoned metadata must never be reused
         long rowIdFloor =
                 Math.max(
@@ -1640,8 +1662,9 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
             return;
         }
 
+        Set<String> retainedManifestPaths = manifestPathsInRetainedMetadata(earliestMetadataId);
         Set<String> expiredManifestLists = new HashSet<>();
-        Set<String> expiredManifestFileMetas = new HashSet<>();
+        Set<String> expiredManifestPaths = new HashSet<>();
         Iterator<Path> it =
                 pathFactory.getAllMetadataPathBefore(table.fileIO(), earliestMetadataId).iterator();
 
@@ -1665,17 +1688,44 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                 }
 
                 for (IcebergManifestFileMeta meta : manifestList.read(listName)) {
-                    String metaName = new Path(meta.manifestPath()).getName();
-                    if (expiredManifestFileMetas.contains(metaName)) {
+                    if (!expiredManifestPaths.add(meta.manifestPath())
+                            || retainedManifestPaths.contains(meta.manifestPath())) {
                         continue;
                     }
-                    expiredManifestFileMetas.add(metaName);
                     table.fileIO().deleteQuietly(new Path(meta.manifestPath()));
                 }
                 table.fileIO().deleteQuietly(listPath);
             }
         }
         deleteApplicableMetadataFiles(snapshotId);
+    }
+
+    /** Returns manifests referenced by metadata versions which are still retained. */
+    private Set<String> manifestPathsInRetainedMetadata(long earliestMetadataId)
+            throws IOException {
+        Set<String> manifestPaths = new HashSet<>();
+        Iterator<Path> it =
+                pathFactory
+                        .getAllMetadataPathBefore(table.fileIO(), Long.MAX_VALUE)
+                        .filter(path -> metadataVersion(path) >= earliestMetadataId)
+                        .iterator();
+        while (it.hasNext()) {
+            IcebergMetadata metadata = IcebergMetadata.fromPath(table.fileIO(), it.next());
+            for (IcebergSnapshot snapshot : metadata.snapshots()) {
+                Path manifestListPath = new Path(snapshot.manifestList());
+                if (table.fileIO().exists(manifestListPath)) {
+                    for (IcebergManifestFileMeta meta :
+                            manifestList.read(snapshot.manifestList())) {
+                        manifestPaths.add(meta.manifestPath());
+                    }
+                }
+            }
+        }
+        return manifestPaths;
+    }
+
+    private long metadataVersion(Path path) {
+        return Long.parseLong(path.getName().split("\\.")[0].substring(1));
     }
 
     private void deleteApplicableMetadataFiles(long snapshotId) throws IOException {
