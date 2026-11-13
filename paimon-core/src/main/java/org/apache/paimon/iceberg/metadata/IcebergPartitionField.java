@@ -23,6 +23,10 @@ import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonGet
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonProperty;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -52,6 +56,22 @@ public class IcebergPartitionField {
 
     @JsonProperty(FIELD_FIELD_ID)
     private final int fieldId;
+
+    public static List<IcebergPartitionField> create(
+            List<String> partitionKeys, IcebergSchema icebergSchema) {
+        Map<String, IcebergDataField> fields = new HashMap<>();
+        for (IcebergDataField field : icebergSchema.fields()) {
+            fields.put(field.name(), field);
+        }
+
+        List<IcebergPartitionField> result = new ArrayList<>();
+        int fieldId = FIRST_FIELD_ID;
+        for (String partitionKey : partitionKeys) {
+            result.add(new IcebergPartitionField(fields.get(partitionKey), fieldId));
+            fieldId++;
+        }
+        return result;
+    }
 
     public IcebergPartitionField(IcebergDataField dataField, int fieldId) {
         this(

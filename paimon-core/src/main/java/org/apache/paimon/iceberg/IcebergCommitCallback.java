@@ -35,7 +35,6 @@ import org.apache.paimon.iceberg.manifest.IcebergManifestFile;
 import org.apache.paimon.iceberg.manifest.IcebergManifestFileMeta;
 import org.apache.paimon.iceberg.manifest.IcebergManifestList;
 import org.apache.paimon.iceberg.manifest.IcebergPartitionSummary;
-import org.apache.paimon.iceberg.metadata.IcebergDataField;
 import org.apache.paimon.iceberg.metadata.IcebergMetadata;
 import org.apache.paimon.iceberg.metadata.IcebergPartitionField;
 import org.apache.paimon.iceberg.metadata.IcebergPartitionSpec;
@@ -483,6 +482,9 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         SnapshotReader snapshotReader = table.newSnapshotReader().withSnapshot(snapshotId);
         Snapshot paimonSnapshot = table.snapshotManager().snapshot(snapshotId);
         SchemaCache schemaCache = new SchemaCache();
+        // the schema of this commit, used for both manifest headers and table metadata
+        int schemaId = (int) schemaCache.getLatestSchemaId();
+        IcebergSchema icebergSchema = schemaCache.get(schemaId);
         List<IcebergManifestEntry> dataFileEntries = new ArrayList<>();
         List<IcebergManifestEntry> dvFileEntries = new ArrayList<>();
         SummaryMetrics metrics = new SummaryMetrics();
@@ -507,7 +509,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         List<IcebergManifestFileMeta> dataManifestFileMetas = new ArrayList<>();
         if (!dataFileEntries.isEmpty()) {
             dataManifestFileMetas.addAll(
-                    manifestFile.rollingWrite(dataFileEntries.iterator(), snapshotId));
+                    manifestFile.rollingWrite(
+                            dataFileEntries.iterator(), snapshotId, icebergSchema));
         }
 
         List<IcebergManifestFileMeta> dvManifestFileMetas = new ArrayList<>();
@@ -516,7 +519,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                     manifestFile.rollingWrite(
                             dvFileEntries.iterator(),
                             snapshotId,
-                            IcebergManifestFileMeta.Content.DELETES));
+                            IcebergManifestFileMeta.Content.DELETES,
+                            icebergSchema));
         }
 
         List<IcebergManifestFileMeta> allManifestFileMetas = new ArrayList<>();
@@ -553,11 +557,9 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         String manifestListFileName = manifestList.writeWithoutRolling(allManifestFileMetas);
 
         // current schema follows the latest; the snapshot entry records its own schema
-        int schemaId = (int) schemaCache.getLatestSchemaId();
         int snapshotSchemaId = (int) paimonSnapshot.schemaId();
-        IcebergSchema icebergSchema = schemaCache.get(schemaId);
         List<IcebergPartitionField> partitionFields =
-                getPartitionFields(table.schema().partitionKeys(), icebergSchema);
+                IcebergPartitionField.create(table.schema().partitionKeys(), icebergSchema);
 
         IcebergSnapshotSummary snapshotSummary =
                 computeSnapshotSummary(
@@ -721,22 +723,6 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                                 deleteFileMeta));
             }
         }
-    }
-
-    private List<IcebergPartitionField> getPartitionFields(
-            List<String> partitionKeys, IcebergSchema icebergSchema) {
-        Map<String, IcebergDataField> fields = new HashMap<>();
-        for (IcebergDataField field : icebergSchema.fields()) {
-            fields.put(field.name(), field);
-        }
-
-        List<IcebergPartitionField> result = new ArrayList<>();
-        int fieldId = IcebergPartitionField.FIRST_FIELD_ID;
-        for (String partitionKey : partitionKeys) {
-            result.add(new IcebergPartitionField(fields.get(partitionKey), fieldId));
-            fieldId++;
-        }
-        return result;
     }
 
     /** VARIANT is an Iceberg format-version-3 type; reject publishing it into v2 metadata. */
@@ -1070,7 +1056,7 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
             // new metadata files.
             newDataManifestFileMetas = new ArrayList<>(baseDataManifestFileMetas);
             newDataManifestFileMetas.addAll(
-                    createNewlyAddedManifestFileMetas(addedFiles, snapshotId));
+                    createNewlyAddedManifestFileMetas(addedFiles, snapshotId, icebergSchema));
             operation = IcebergSnapshotSummary.APPEND.operation();
         } else {
             Pair<List<IcebergManifestFileMeta>, String> result =
@@ -1080,7 +1066,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                             modifiedPartitions,
                             baseDataManifestFileMetas,
                             snapshotId,
-                            snapshot.commitKind());
+                            snapshot.commitKind(),
+                            icebergSchema);
             newDataManifestFileMetas = result.getLeft();
             operation = result.getRight();
         }
@@ -1089,7 +1076,7 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         if (needAddDvToIceberg) {
             if (!indexFiles.isEmpty()) {
                 // reconstruct the dv index
-                newDVManifestFileMetas.addAll(createDvManifestFileMetas(snapshot));
+                newDVManifestFileMetas.addAll(createDvManifestFileMetas(snapshot, icebergSchema));
             } else {
                 // no new dv index, reuse the old one
                 newDVManifestFileMetas.addAll(baseDVManifestFileMetas);
@@ -1097,7 +1084,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         }
 
         // compact data manifest file if needed
-        newDataManifestFileMetas = compactMetadataIfNeeded(newDataManifestFileMetas, snapshotId);
+        newDataManifestFileMetas =
+                compactMetadataIfNeeded(newDataManifestFileMetas, snapshotId, icebergSchema);
 
         SummaryMetrics metrics = new SummaryMetrics();
         metrics.addedDataFiles = addedFiles.size();
@@ -1348,7 +1336,9 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
     }
 
     private List<IcebergManifestFileMeta> createNewlyAddedManifestFileMetas(
-            Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles, long currentSnapshotId)
+            Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles,
+            long currentSnapshotId,
+            IcebergSchema icebergSchema)
             throws IOException {
         if (addedFiles.isEmpty()) {
             return Collections.emptyList();
@@ -1379,7 +1369,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                                             icebergFileMeta);
                                 })
                         .iterator(),
-                currentSnapshotId);
+                currentSnapshotId,
+                icebergSchema);
     }
 
     private Pair<List<IcebergManifestFileMeta>, String> createWithDeleteManifestFileMetas(
@@ -1388,7 +1379,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
             List<BinaryRow> modifiedPartitions,
             List<IcebergManifestFileMeta> baseManifestFileMetas,
             long currentSnapshotId,
-            Snapshot.CommitKind commitKind)
+            Snapshot.CommitKind commitKind,
+            IcebergSchema icebergSchema)
             throws IOException {
         String operation = IcebergSnapshotSummary.APPEND.operation();
         List<IcebergManifestFileMeta> newManifestFileMetas = new ArrayList<>();
@@ -1472,7 +1464,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                         }
                     }
                     newManifestFileMetas.addAll(
-                            manifestFile.rollingWrite(newEntries.iterator(), currentSnapshotId));
+                            manifestFile.rollingWrite(
+                                    newEntries.iterator(), currentSnapshotId, icebergSchema));
                 }
             } else {
                 // partition of this file meta is not modified in this snapshot,
@@ -1482,7 +1475,7 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         }
 
         newManifestFileMetas.addAll(
-                createNewlyAddedManifestFileMetas(addedFiles, currentSnapshotId));
+                createNewlyAddedManifestFileMetas(addedFiles, currentSnapshotId, icebergSchema));
         return Pair.of(newManifestFileMetas, operation);
     }
 
@@ -1491,7 +1484,10 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
     // -------------------------------------------------------------------------------------
 
     private List<IcebergManifestFileMeta> compactMetadataIfNeeded(
-            List<IcebergManifestFileMeta> toCompact, long currentSnapshotId) throws IOException {
+            List<IcebergManifestFileMeta> toCompact,
+            long currentSnapshotId,
+            IcebergSchema icebergSchema)
+            throws IOException {
         List<IcebergManifestFileMeta> result = new ArrayList<>();
         long targetSizeInBytes = table.coreOptions().manifestTargetSize().getBytes();
 
@@ -1560,7 +1556,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                 };
         Iterable<IcebergManifestEntry> newEntries =
                 ManifestReadThreadPool.sequentialBatchedExecute(processor, candidates, null);
-        result.addAll(manifestFile.rollingWrite(newEntries.iterator(), currentSnapshotId));
+        result.addAll(
+                manifestFile.rollingWrite(newEntries.iterator(), currentSnapshotId, icebergSchema));
         return result;
     }
 
@@ -1825,7 +1822,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                 && formatVersion == IcebergMetadata.FORMAT_VERSION_V3;
     }
 
-    private List<IcebergManifestFileMeta> createDvManifestFileMetas(Snapshot snapshot) {
+    private List<IcebergManifestFileMeta> createDvManifestFileMetas(
+            Snapshot snapshot, IcebergSchema icebergSchema) {
         List<IcebergManifestEntry> icebergDvEntries = new ArrayList<>();
 
         long snapshotId = snapshot.id();
@@ -1878,7 +1876,10 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         }
 
         return manifestFile.rollingWrite(
-                icebergDvEntries.iterator(), snapshotId, IcebergManifestFileMeta.Content.DELETES);
+                icebergDvEntries.iterator(),
+                snapshotId,
+                IcebergManifestFileMeta.Content.DELETES,
+                icebergSchema);
     }
 
     // -------------------------------------------------------------------------------------

@@ -27,6 +27,7 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.iceberg.IcebergOptions;
 import org.apache.paimon.iceberg.IcebergPathFactory;
+import org.apache.paimon.iceberg.metadata.IcebergSchema;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.FileSystemSchemaManager;
@@ -83,7 +84,8 @@ class IcebergManifestBlockSizeTest {
                         new IcebergManifestEntry(
                                 IcebergManifestEntry.Status.ADDED, 1, 1, 1, dataFile));
 
-        List<IcebergManifestFileMeta> files = manifest.rollingWrite(entries.iterator(), 1);
+        List<IcebergManifestFileMeta> files =
+                manifest.rollingWrite(entries.iterator(), 1, IcebergSchema.create(table.schema()));
 
         assertThat(files).hasSize(1);
         assertDefaultBlocks(table, new Path(files.get(0).manifestPath()), "manifest_entry");

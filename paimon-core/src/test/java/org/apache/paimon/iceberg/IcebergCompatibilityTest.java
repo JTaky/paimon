@@ -101,6 +101,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -2966,6 +2967,65 @@ public class IcebergCompatibilityTest {
             parseAvroFields(schema, fieldIdMap, schema.getName());
         }
         return fieldIdMap;
+    }
+
+    @Test
+    public void testManifestHeaderSchemaFollowsSchemaChange() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType, Collections.emptyList(), Collections.singletonList("k"), 1);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        // the same commit, hence the same commit callback, serves both commits
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(1, write.prepareCommit(true, 1));
+        assertThat(newestManifestHeaderSchemaId()).isEqualTo(0);
+
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
+        schemaManager.commitChanges(SchemaChange.addColumn("v2", DataTypes.STRING()));
+        write.close();
+        write = table.copyWithLatestSchema().newWrite(commitUser);
+
+        write.write(GenericRow.of(2, 20, BinaryString.fromString("two")));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+
+        long snapshotId = table.snapshotManager().latestSnapshotId();
+        IcebergMetadata metadata =
+                IcebergMetadata.fromPath(
+                        table.fileIO(),
+                        new Path(table.location(), "metadata/v" + snapshotId + ".metadata.json"));
+        assertThat(metadata.currentSchemaId()).isEqualTo(1);
+        assertThat(newestManifestHeaderSchemaId()).isEqualTo(metadata.currentSchemaId());
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 10, null)", "Record(2, 20, two)");
+
+        write.close();
+        commit.close();
+    }
+
+    private int newestManifestHeaderSchemaId() throws Exception {
+        org.apache.iceberg.Table icebergTable = getIcebergTable();
+        // the manifest written for the current snapshot has the highest sequence number
+        org.apache.iceberg.ManifestFile newest =
+                icebergTable.currentSnapshot().allManifests(icebergTable.io()).stream()
+                        .max(
+                                Comparator.comparingLong(
+                                        org.apache.iceberg.ManifestFile::sequenceNumber))
+                        .get();
+        try (DataFileReader<GenericRecord> reader =
+                new DataFileReader<>(
+                        new SeekableFileInput(new File(newest.path())),
+                        new GenericDatumReader<>())) {
+            return Integer.parseInt(reader.getMetaString("schema-id"));
+        }
     }
 
     private void parseAvroFields(

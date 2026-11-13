@@ -33,7 +33,6 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.iceberg.IcebergOptions;
 import org.apache.paimon.iceberg.IcebergPathFactory;
 import org.apache.paimon.iceberg.manifest.IcebergManifestFileMeta.Content;
-import org.apache.paimon.iceberg.metadata.IcebergDataField;
 import org.apache.paimon.iceberg.metadata.IcebergMetadata;
 import org.apache.paimon.iceberg.metadata.IcebergPartitionField;
 import org.apache.paimon.iceberg.metadata.IcebergPartitionSpec;
@@ -59,7 +58,6 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -78,7 +76,8 @@ public class IcebergManifestFile extends ObjectsFile<IcebergManifestEntry> {
 
     private final RowType partitionType;
     private final FormatWriterFactory writerFactory;
-    private final Map<String, String> manifestMetadata;
+    private final List<String> partitionKeys;
+    private final int formatVersion;
     private final MemorySize targetFileSize;
 
     public IcebergManifestFile(
@@ -89,29 +88,9 @@ public class IcebergManifestFile extends ObjectsFile<IcebergManifestEntry> {
             FormatWriterFactory writerFactory,
             String compression,
             PathFactory pathFactory,
-            MemorySize targetFileSize) {
-        this(
-                fileIO,
-                partitionType,
-                withFirstRowId,
-                readerFactory,
-                writerFactory,
-                compression,
-                pathFactory,
-                targetFileSize,
-                Collections.emptyMap());
-    }
-
-    private IcebergManifestFile(
-            FileIO fileIO,
-            RowType partitionType,
-            boolean withFirstRowId,
-            FormatReaderFactory readerFactory,
-            FormatWriterFactory writerFactory,
-            String compression,
-            PathFactory pathFactory,
             MemorySize targetFileSize,
-            Map<String, String> manifestMetadata) {
+            List<String> partitionKeys,
+            int formatVersion) {
         super(
                 fileIO,
                 new IcebergManifestEntrySerializer(partitionType, withFirstRowId),
@@ -122,8 +101,13 @@ public class IcebergManifestFile extends ObjectsFile<IcebergManifestEntry> {
                 pathFactory,
                 null);
         this.partitionType = partitionType;
+        // Iceberg readers need the schema and partition spec in the manifest header.
+        Preconditions.checkArgument(
+                writerFactory instanceof SupportsFileMetadata,
+                "Iceberg manifest format must support file metadata");
         this.writerFactory = writerFactory;
-        this.manifestMetadata = new HashMap<>(manifestMetadata);
+        this.partitionKeys = partitionKeys;
+        this.formatVersion = formatVersion;
         this.targetFileSize = targetFileSize;
     }
 
@@ -164,32 +148,21 @@ public class IcebergManifestFile extends ObjectsFile<IcebergManifestEntry> {
                 avroOptions.get(IcebergOptions.MANIFEST_COMPRESSION),
                 pathFactory.manifestFileFactory(),
                 table.coreOptions().manifestTargetSize(),
-                createManifestMetadata(table));
+                table.schema().partitionKeys(),
+                table.coreOptions().toConfiguration().get(IcebergOptions.FORMAT_VERSION));
     }
 
-    private static Map<String, String> createManifestMetadata(FileStoreTable table) {
-        IcebergSchema icebergSchema = IcebergSchema.create(table.schema());
-        Map<String, IcebergDataField> fieldsByName = new HashMap<>();
-        for (IcebergDataField field : icebergSchema.fields()) {
-            fieldsByName.put(field.name(), field);
-        }
-
-        List<IcebergPartitionField> partitionFields = new ArrayList<>();
-        int partitionFieldId = IcebergPartitionField.FIRST_FIELD_ID;
-        for (String partitionKey : table.schema().partitionKeys()) {
-            partitionFields.add(
-                    new IcebergPartitionField(fieldsByName.get(partitionKey), partitionFieldId++));
-        }
+    private Map<String, String> createHeaderMetadata(Content content, IcebergSchema icebergSchema) {
+        List<IcebergPartitionField> partitionFields =
+                IcebergPartitionField.create(partitionKeys, icebergSchema);
 
         Map<String, String> metadata = new HashMap<>();
         metadata.put("schema", icebergSchema.toJson());
         metadata.put("schema-id", String.valueOf(icebergSchema.schemaId()));
         metadata.put("partition-spec", JsonSerdeUtil.toJson(partitionFields));
         metadata.put("partition-spec-id", String.valueOf(IcebergPartitionSpec.SPEC_ID));
-        metadata.put(
-                "format-version",
-                String.valueOf(
-                        table.coreOptions().toConfiguration().get(IcebergOptions.FORMAT_VERSION)));
+        metadata.put("format-version", String.valueOf(formatVersion));
+        metadata.put("content", content == Content.DATA ? "data" : "deletes");
         return metadata;
     }
 
@@ -231,17 +204,25 @@ public class IcebergManifestFile extends ObjectsFile<IcebergManifestEntry> {
         }
     }
 
+    /**
+     * Writes manifest files whose Avro header carries the Iceberg metadata for the given schema,
+     * which should be the schema written to the table metadata of the same snapshot.
+     */
     public List<IcebergManifestFileMeta> rollingWrite(
-            Iterator<IcebergManifestEntry> entries, long sequenceNumber) {
-
-        return rollingWrite(entries, sequenceNumber, Content.DATA);
+            Iterator<IcebergManifestEntry> entries,
+            long sequenceNumber,
+            IcebergSchema icebergSchema) {
+        return rollingWrite(entries, sequenceNumber, Content.DATA, icebergSchema);
     }
 
     public List<IcebergManifestFileMeta> rollingWrite(
-            Iterator<IcebergManifestEntry> entries, long sequenceNumber, Content content) {
+            Iterator<IcebergManifestEntry> entries,
+            long sequenceNumber,
+            Content content,
+            IcebergSchema icebergSchema) {
         RollingFileWriterImpl<IcebergManifestEntry, IcebergManifestFileMeta> writer =
                 new RollingFileWriterImpl<>(
-                        () -> createWriter(sequenceNumber, content),
+                        () -> createWriter(sequenceNumber, content, icebergSchema),
                         targetFileSize.getBytes(),
                         Long.MAX_VALUE);
         try {
@@ -254,18 +235,11 @@ public class IcebergManifestFile extends ObjectsFile<IcebergManifestEntry> {
     }
 
     public SingleFileWriter<IcebergManifestEntry, IcebergManifestFileMeta> createWriter(
-            long sequenceNumber, Content content) {
-        FormatWriterFactory manifestWriterFactory = writerFactory;
-        if (!manifestMetadata.isEmpty()) {
-            Preconditions.checkArgument(
-                    writerFactory instanceof SupportsFileMetadata,
-                    "Iceberg manifest format must support file metadata");
-            Map<String, String> metadata = new HashMap<>(manifestMetadata);
-            metadata.put("content", content == Content.DATA ? "data" : "deletes");
-            SupportsFileMetadata metadataWriterFactory = (SupportsFileMetadata) writerFactory;
-            manifestWriterFactory =
-                    (out, compression) -> metadataWriterFactory.create(out, compression, metadata);
-        }
+            long sequenceNumber, Content content, IcebergSchema icebergSchema) {
+        Map<String, String> metadata = createHeaderMetadata(content, icebergSchema);
+        SupportsFileMetadata metadataWriterFactory = (SupportsFileMetadata) writerFactory;
+        FormatWriterFactory manifestWriterFactory =
+                (out, compression) -> metadataWriterFactory.create(out, compression, metadata);
         return new IcebergManifestEntryWriter(
                 manifestWriterFactory, pathFactory.newPath(), compression, sequenceNumber, content);
     }
